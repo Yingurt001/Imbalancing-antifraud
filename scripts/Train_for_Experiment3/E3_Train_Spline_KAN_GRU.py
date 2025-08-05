@@ -1,339 +1,214 @@
-
-
-import tensorflow as tf
-ops = tf
 import os
-import numpy as np
-import tensorflow as tf
-import keras
-from keras import backend
-from keras.src import initializers
-from keras.src.layers import Layer, Dropout, LayerNormalization
-from keras.models import Model,load_model
-from keras.layers import GRU, LSTM, Dense, Dropout, BatchNormalization, Input, Masking, Layer
-from keras.optimizers import Adam
-from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from concurrent.futures import ThreadPoolExecutor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,confusion_matrix,roc_auc_score
 import pandas as pd
-from keras.utils import CustomObjectScope
-from tqdm.keras import TqdmCallback
-import time
-# 自定义 KANLayer
+import numpy as np
+import random
+import csv
 
-@keras.utils.register_keras_serializable(package="keras_efficient_kan", name="GridInitializer")
-class GridInitializer(initializers.Initializer):
-    def __init__(self, grid_range, grid_size, spline_order):
-        self.grid_range = grid_range
-        self.grid_size = grid_size
-        self.spline_order = spline_order
+# Step 1: 读取并处理原始数据
+def load_and_process_data(input_file, fraction=0.1, seed=42):
+    """
+    读取 CSV 文件，按 LOAN SEQUENCE NUMBER 分组，用于按贷款追踪每个样本的历史序列。
+    支持基于贷款编号的分组抽样（而非逐行抽样）。
+    """
+    df = pd.read_csv(input_file)
 
-    def __call__(self, shape, dtype=None):
-        h = (self.grid_range[1] - self.grid_range[0]) / self.grid_size
-        start = -self.spline_order * h + self.grid_range[0]
-        stop = (self.grid_size + self.spline_order) * h + self.grid_range[0]
-        num = self.grid_size + 2 * self.spline_order + 1
+    # 先获取所有的贷款编号（唯一的 LOAN SEQUENCE NUMBER）
+    unique_loans = df['LOAN SEQUENCE NUMBER'].unique()
+    np.random.seed(seed)
+
+    if 0 < fraction < 1.0:
+        sampled_loans = np.random.choice(unique_loans, size=int(len(unique_loans) * fraction), replace=False)
+        df = df[df['LOAN SEQUENCE NUMBER'].isin(sampled_loans)]
+
+    sorted_data = df.sort_values('LOAN SEQUENCE NUMBER')  # 保证分组前排序
+    grouped_data = sorted_data.groupby('LOAN SEQUENCE NUMBER')  # 按贷款编号分组
+    return grouped_data, df
+
+
+# Step 2: 构建测试集
+def build_test_data(grouped_data, master_data_size, split_ratio, stats_accumulator):
+    """
+    构造测试样本，每个贷款截取固定长度的历史（master_data_size），判断是否违约。
+
+    参数：
+    - grouped_data: 按贷款分组后的数据
+    - master_data_size: 每个样本截取的时间步长度
+    - split_ratio: 欠采样比例（非违约 : 违约）
+    - stats_accumulator: 用于累积统计量的字典
+
+    返回：
+    - X, Y: numpy 格式的测试特征和标签
+    """
+    test_data_X = []
+    test_data_Y = []
+    predict_month = 3  # 留 3 个月做预测窗口
+
+    num_defaults = 0
+    total_rows_all_groups = 0
+    all_group_sizes = []
+
+    for _, group in grouped_data:
+        # 按剩余月份倒序排列，确保时间一致性
+        group = group.sort_values('REMAINING MONTHS TO LEGAL MATURITY', ascending=False)
+        group_size = len(group)
+        total_rows_all_groups += group_size
+        all_group_sizes.append(group_size)
+
+        if group.iloc[:, -1].sum() > 0:  # 如果某贷款存在违约
+            num_defaults += 1
         
-        # Create the grid using numpy
-        grid = np.linspace(start, stop, num, dtype=np.float32)
-        
-        # Repeat the grid for each feature
-        grid = np.tile(grid, (shape[1], 1))
-        
-        # Add the batch dimension
-        grid = np.expand_dims(grid, 0)
-        
-        # Convert to the appropriate backend tensor
-        return ops.convert_to_tensor(grid, dtype=dtype)
+        if group_size >= master_data_size + predict_month:
+            # 截取前一段作为特征
+            X = group.iloc[0:master_data_size, 1:-1]
+            # 接下来的 predict_month 作为标签判断未来违约
+            Y = group.iloc[master_data_size:master_data_size + predict_month, -1]
 
-    def get_config(self):
-        return {
-            "grid_range": self.grid_range,
-            "grid_size": self.grid_size,
-            "spline_order": self.spline_order
-        }
+            # 删除可能导致泄漏或高度相关的列
+            cols_to_remove = ['ZERO BALANCE CODE', 'REMAINING MONTHS TO LEGAL MATURITY']
+            for col in cols_to_remove:
+                if col in X.columns:
+                    X = X.drop(columns=col)
 
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-@keras.utils.register_keras_serializable(package="keras_efficient_kan", name="KANLinear")
-class KANLinear(Layer):
-    def __init__(
-        self,
-        units,
-        grid_size=3,
-        spline_order=3,
-        base_activation='relu',
-        grid_range=[-1, 1],
-        dropout=0.,
-        use_bias=True,
-        use_layernorm=True,
-        **kwargs
-    ):
-        super(KANLinear, self).__init__(**kwargs)
-        self.units = units
-        self.grid_size = grid_size
-        self.spline_order = spline_order
-        self.base_activation_name = base_activation
-        self.grid_range = grid_range
-        self.use_bias = use_bias
-        self.use_layernorm = use_layernorm
-        self.dropout_rate = dropout
-        self.dropout = Dropout(self.dropout_rate)
-        if self.use_layernorm:
-            self.layer_norm = LayerNormalization(axis=-1)
-        else:
-            self.layer_norm = None
-        self.in_features = None
-
-    def build(self, input_shape):
-        self.in_features = input_shape[-1]
-        dtype = backend.floatx()
-        
-        self.grid = self.add_weight(
-            name="grid",
-            shape=[1, self.in_features, self.grid_size + 2 * self.spline_order + 1],
-            initializer=GridInitializer(self.grid_range, self.grid_size, self.spline_order),
-            trainable=False,
-            dtype=dtype
-        )
-
-        self.base_weight = self.add_weight(
-            name="base_weight",
-            shape=[self.in_features, self.units],
-            initializer='glorot_uniform',
-            dtype=dtype
-        )
-        if self.use_bias:
-            self.base_bias = self.add_weight(
-                name="base_bias",
-                shape=[self.units],
-                initializer="zeros",
-                dtype=dtype
-            )
-        self.spline_weight = self.add_weight(
-            name="spline_weight",
-            shape=[self.in_features * (self.grid_size + self.spline_order), self.units],
-            initializer='glorot_uniform',
-            dtype=dtype
-        )
-        if self.use_layernorm:
-            self.layer_norm.build(input_shape)
-        
-        self.built = True
-
-    def call(self, x, training=None):
-        input_shape = ops.shape(x)
-        x = ops.cast(x, self.dtype)
-        x_2d = ops.reshape(x, [-1, self.in_features])
-        
-        if self.use_layernorm:
-            x_2d = self.layer_norm(x_2d)
-        
-        base_activation = getattr(tf.nn, self.base_activation_name)
-        base_output = ops.matmul(base_activation(x_2d), self.base_weight)
-        if self.use_bias:
-            base_output = ops.add(base_output, self.base_bias)
-        
-        spline_output = ops.matmul(self.b_splines(x_2d), self.spline_weight)
-        output_2d = self.dropout(base_output, training=training) + self.dropout(spline_output, training=training)
-        
-        # Use ops.reshape with a tuple of integers for the new shape
-        new_shape = tf.concat([input_shape[:-1], [self.units]], axis=0)
-        return ops.reshape(output_2d, new_shape)
-
-    def b_splines(self, x):
-        x_expanded = ops.expand_dims(x, -1)
-        bases = ops.cast((x_expanded >= self.grid[..., :-1]) & (x_expanded < self.grid[..., 1:]), self.dtype)
-        
-        for k in range(1, self.spline_order + 1):
-            left_denominator = self.grid[..., k:-1] - self.grid[..., :-(k + 1)]
-            right_denominator = self.grid[..., k + 1:] - self.grid[..., 1:-k]
-            
-            left = (x_expanded - self.grid[..., :-(k + 1)]) / left_denominator
-            right = (self.grid[..., k + 1:] - x_expanded) / right_denominator
-            bases = left * bases[..., :-1] + right * bases[..., 1:]
-        return ops.reshape(bases, [ops.shape(x)[0], -1])
-
-    def compute_output_shape(self, input_shape):
-        return input_shape[:-1] + (self.units,)
-
-    def get_config(self):
-        config = super(KANLinear, self).get_config()
-        config.update({
-            'units': self.units,
-            'grid_size': self.grid_size,
-            'spline_order': self.spline_order,
-            'base_activation': self.base_activation_name,
-            'grid_range': self.grid_range,
-            'dropout': self.dropout_rate,
-            'use_bias': self.use_bias,
-            'use_layernorm': self.use_layernorm,
-        })
-        return config
-
-    def get_build_config(self):
-        return {"in_features": self.in_features}
-
-    def build_from_config(self, config):
-        self.build((None, config["in_features"]))
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
+            label = 1 if Y.sum() > 0 else 0
+            test_data_X.append(X.values)
+            test_data_Y.append(label)
 
 
-# 构建模型
-def KANS_GRU_model(input_shape, output_dim=1, num_functions=10):
-    inputs = Input(shape=input_shape)
-    masked_input = Masking(mask_value=0.0)(inputs)
-    
-    # GRU layers
-    gru_out = GRU(128, return_sequences=True)(masked_input)
-    gru_out = BatchNormalization()(gru_out)
-    gru_out2 = GRU(64, return_sequences=False)(gru_out)
-    
-    # KAN layer
-    kan_out = KANLinear(units=5, grid_size=3, spline_order=3)(gru_out2)
-    
-    # Dense layer + Dropout
-    dense_out = Dense(64, activation='relu')(kan_out)
-    dropout_out = Dropout(0.3)(dense_out)
-    
-    # Output layer
-    outputs = Dense(1, activation='sigmoid')(dropout_out)
-    
-    model = Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
-    
-    return model
+    # 原始样本统计信息记录
+    stats_accumulator["original_sample_size"] += total_rows_all_groups
+    stats_accumulator["original_num_loans"] += len(all_group_sizes)
+    stats_accumulator["original_total_loan_length"] += sum(all_group_sizes)
+    stats_accumulator["original_num_defaults"] += num_defaults
 
-# 评估模型性能的函数
-def evaluate_model(master_data_size, test_X, test_Y, run):
-    print(f"Test_X shape: {test_X.shape}, Test_Y shape: {test_Y.shape}")
-    try:
-        # 加载每次运行中验证集上表现最好的模型
-        model_path = f'实验三models/真KAN/KAN_GRU_best_model_master_data_size_{master_data_size}_run_{run}.h5'
-        model = load_model(model_path, custom_objects={'KANLinear': KANLinear})
-    except FileNotFoundError:
-        print(f"Model for master_data_size {master_data_size}, run {run} not found at {model_path}. Skipping this run.")
-        return None
-    except ValueError as e:
-        print(f"Error loading model: {e}")
-        return None
+    # 执行欠采样
+    default = [(x, 1) for x, y in zip(test_data_X, test_data_Y) if y == 1]
+    undefault = [(x, 0) for x, y in zip(test_data_X, test_data_Y) if y == 0]
+    sampled_undefault = undefault[:split_ratio * len(default)]  # 根据比例选取负样本
+    combined = default + sampled_undefault
+    random.shuffle(combined)  # 打乱顺序
 
-    # 在测试集上评估模型性能
-    test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
-    print(f'master_data_size {master_data_size}, Run {run} - Test Accuracy: {test_acc:.3f}')
+    # 记录最终样本集统计信息
+    stats_accumulator["final_sample_size"] += sum([len(x[0]) for x in combined])
+    stats_accumulator["final_num_loans"] += len(combined)
+    stats_accumulator["final_total_loan_length"] += sum([len(x[0]) for x in combined])
+    stats_accumulator["final_num_defaults"] += sum([y for _, y in combined])
 
-    # 预测概率和分类标签
-    yhat_probs = model.predict(test_X, verbose=0)
-    yhat_probs = yhat_probs[:, 0]
-    yhat_classes = (yhat_probs > 0.5).astype(int)
+    if not combined:
+        return np.array([]), np.array([])
 
-    # 计算并打印性能指标
-    accuracy = accuracy_score(test_Y, yhat_classes)
-    precision = precision_score(test_Y, yhat_classes)
-    recall = recall_score(test_Y, yhat_classes)
-    f1 = f1_score(test_Y, yhat_classes)
-    conf_matrix = confusion_matrix(test_Y, yhat_classes)
-    auc = roc_auc_score(test_Y, yhat_probs)
+    X, Y = zip(*combined)
+    return np.array(X, dtype='float32'), np.array(Y, dtype='float32')
 
-    print(f'master_data_size {master_data_size}, Run {run} - Accuracy: {accuracy:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - Precision: {precision:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - Recall: {recall:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - F1 Score: {f1:.3f}')
-    print(f'Interval {master_data_sizes}, Run {run} - AUC: {auc:.3f}')
-    
-    return {
-        'master_data_size': master_data_size,
-        'run': run,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'auc': auc
-        
-    }
-# 保存结果到 CSV
-def save_results_to_csv(results, filepath):
-    df = pd.DataFrame(results)
-    df.to_csv(filepath, index=False)
-    print(f"Results saved to {filepath}")
+# Step 3: 保存数据到本地
+def save_data(X, Y, output_dir):
+    """
+    将生成的测试集保存为 .npy 格式
 
-# 主函数
+    参数：
+    - X, Y: 测试集的特征和标签
+    - output_dir: 保存的文件夹路径
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    np.save(os.path.join(output_dir, 'testX.npy'), X)
+    np.save(os.path.join(output_dir, 'testY.npy'), Y)
+    print(f"✅ Saved to {output_dir} | Samples: {len(Y)}, Defaults: {int(Y.sum())}, Non-defaults: {len(Y) - int(Y.sum())}")
+
+# 主流程控制（批量生成不同参数组合的数据）
 if __name__ == "__main__":
-    results = []
-    csv_file_path = 'E3_KAN_GRU_model_results.csv'
-    os.makedirs(os.path.dirname(csv_file_path) or ".", exist_ok=True)
+    # 原始数据来源
+    input_files = [
+        "data/processed_data/historical_data_time_2019Q1.csv",
+        "data/processed_data/historical_data_time_2019Q2.csv",
+        "data/processed_data/historical_data_time_2019Q3.csv",
+        "data/processed_data/historical_data_time_2019Q4.csv"
+    ]
 
-    master_data_sizes = [15, 18, 21, 24, 27]
-    split_ratios = [1, 2, 5, 10, 25]  # 对应 test_merged_... 的不同欠采样比例
+    # 设置不同的主数据长度和采样比例
+    master_data_sizes = [12, 15, 18, 21, 24, 27]
+    split_ratios = [1, 2, 5, 10, 25]
 
-    for master_data_size in master_data_sizes:
-        for split_ratio in split_ratios:
-            print(f"\n🔧 Processing master_data_size = {master_data_size}, split_ratio = 1:{split_ratio}")
+    # 汇总统计信息保存路径
+    stats_csv_path = "test_data_summary.csv"
+    write_header = not os.path.exists(stats_csv_path)
 
-            # 路径设定（注意：train 路径不变，test 路径带上 split_ratio 和 2019）
-            train_x_path = f'data/npy_merged_master_data_size_{master_data_size}/trainX.npy'
-            train_y_path = f'data/npy_merged_master_data_size_{master_data_size}/trainY.npy'
-            test_x_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testX.npy'
-            test_y_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testY.npy'
+    # 读取年份（假设全部是同一年）
+    year_str = os.path.basename(input_files[0]).split('_')[-1][:4]
 
-            try:
-                train_GRU_X = np.load(train_x_path)
-                train_GRU_y = np.load(train_y_path)
-                test_X = np.load(test_x_path)
-                test_Y = np.load(test_y_path)
-            except FileNotFoundError as e:
-                print(f"❌ Data not found: {e}")
-                continue
+    # 打开 CSV 写入文件
+    with open(stats_csv_path, mode="a", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        if write_header:
+            writer.writerow([
+                "year", "master_data_size", "split_ratio",
+                "original_sample_size", "original_num_loans", "avg_loan_length", "num_defaults", "default_rate",
+                "final_sample_size", "final_num_loans", "final_avg_loan_length", "final_num_defaults", "final_default_rate"
+            ])
+            csvfile.flush()  # 写入表头后立即保存
 
-            print(f"✅ train_X shape: {train_GRU_X.shape}, train_y shape: {train_GRU_y.shape}")
+        # 枚举不同参数组合
+        for master_data_size in master_data_sizes:
+            for split_ratio in split_ratios:
+                print(f"\n🔧 master_data_size = {master_data_size}, split_ratio = 1:{split_ratio}")
 
-            # 拆分训练/验证集
-            train_GRU_X, val_GRU_X, train_GRU_y, val_GRU_y = train_test_split(
-                train_GRU_X, train_GRU_y, test_size=0.2, random_state=42, stratify=train_GRU_y)
+                all_X, all_Y = [], []
+                stats = {
+                    "original_sample_size": 0,
+                    "original_num_loans": 0,
+                    "original_total_loan_length": 0,
+                    "original_num_defaults": 0,
+                    "final_sample_size": 0,
+                    "final_num_loans": 0,
+                    "final_total_loan_length": 0,
+                    "final_num_defaults": 0
+                }
 
-            
-            for run in range(1, 21):
-                print(f"🚀 Training: master_data_size={master_data_size}, split_ratio=1:{split_ratio}, run={run}")
-                try:
-                    input_shape = (train_GRU_X.shape[1], train_GRU_X.shape[2])
-                    model = KANS_GRU_model(input_shape)
+                # 遍历每个季度数据
+                for input_file in input_files:
+                    if not os.path.exists(input_file):
+                        print(f"❌ File not found: {input_file}")
+                        continue
 
-                    model_save_path = f'实验三models/真KAN/KAN_GRU_best_model_master_data_size_{master_data_size}_ratio1to{split_ratio}_run_{run}.h5'
-                    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+                    grouped_data, _ = load_and_process_data(input_file)
+                    X, Y = build_test_data(grouped_data, master_data_size, split_ratio, stats)
 
-                    checkpoint = ModelCheckpoint(model_save_path, monitor='val_accuracy', verbose=0,
-                                                save_best_only=True, mode='max')
+                    if X.size == 0:
+                        continue
 
-                    start_time = time.time()
-                    model.fit(
-                        train_GRU_X, train_GRU_y,
-                        epochs=25,
-                        batch_size=64,
-                        validation_data=(val_GRU_X, val_GRU_y),
-                        callbacks=[checkpoint, TqdmCallback(verbose=1)]
-                    )
-                    end_time = time.time()
-                    print(f"⏱️ Run time: {end_time - start_time:.2f} seconds")
+                    all_X.append(X)
+                    all_Y.append(Y)
 
-                    result = evaluate_model(master_data_size, test_X, test_Y, run)
-                    if result:
-                        result["split_ratio"] = split_ratio
-                        results.append(result)
-                        save_results_to_csv(results, csv_file_path)
+                # 合并所有季度的数据
+                if all_X and all_Y:
+                    final_X = np.concatenate(all_X, axis=0)
+                    final_Y = np.concatenate(all_Y, axis=0)
 
-                except Exception as e:
-                    print(f"❌ Error: master_data_size={master_data_size}, split_ratio=1:{split_ratio}, run={run} -> {e}")
-                    save_results_to_csv(results, csv_file_path)
-                    continue
+                    # 按参数命名保存路径
+                    output_dir = f"data/test_merged_{year_str}_master{master_data_size}_ratio1to{split_ratio}"
+                    save_data(final_X, final_Y, output_dir)
 
-    # 最终结果保存
-    print("\n✅ All Results:")
-    for result in results:
-        print(result)
-    save_results_to_csv(results, csv_file_path)
+                    # 计算统计量
+                    avg_len = stats['original_total_loan_length'] / stats['original_num_loans'] if stats['original_num_loans'] else 0
+                    final_avg_len = stats['final_total_loan_length'] / stats['final_num_loans'] if stats['final_num_loans'] else 0
+                    default_rate = stats['original_num_defaults'] / stats['original_num_loans'] if stats['original_num_loans'] else 0
+                    final_default_rate = stats['final_num_defaults'] / stats['final_num_loans'] if stats['final_num_loans'] else 0
+
+                    # 写入统计信息到 CSV
+                    writer.writerow([
+                        year_str,
+                        master_data_size,
+                        split_ratio,
+                        stats['original_sample_size'],
+                        stats['original_num_loans'],
+                        round(avg_len, 2),
+                        stats['original_num_defaults'],
+                        round(default_rate, 4),
+                        stats['final_sample_size'],
+                        stats['final_num_loans'],
+                        round(final_avg_len, 2),
+                        stats['final_num_defaults'],
+                        round(final_default_rate, 4)
+                    ])
+                    csvfile.flush()
+                    print(f"📈 Stats recorded: {stats['final_num_loans']} loans | {stats['final_num_defaults']} defaults")
+                else:
+                    print("⚠️ No valid samples generated. Skipping.")
