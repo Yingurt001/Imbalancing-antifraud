@@ -1,17 +1,25 @@
-#!/usr/bin/env python3
 
+
+import tensorflow as tf
+ops = tf
 import os
 import numpy as np
-import pandas as pd
 import tensorflow as tf
-from keras.models import Model, load_model
-from keras.layers import GRU, Dense, Dropout, Input, Masking, Flatten
-from keras.layers import GRU, Dense, Masking, Flatten
+import keras
+from keras import backend
+from keras.src import initializers
+from keras.src.layers import Layer, Dropout, LayerNormalization
+from keras.models import Model,load_model
+from keras.layers import GRU, LSTM, Dense, Dropout, BatchNormalization, Input, Masking, Layer,Flatten
 from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from keras.preprocessing.sequence import pad_sequences
-from keras.callbacks import ModelCheckpoint
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,confusion_matrix,roc_auc_score
+import pandas as pd
+from keras.utils import CustomObjectScope
+from tqdm.keras import TqdmCallback
+import time
 
 # 构建 GRU 模型
 def masked_GRU_model(input_shape):
@@ -29,114 +37,135 @@ def masked_GRU_model(input_shape):
     return model
 
 # 评估模型性能的函数
-def evaluate_model(master_data_size, test_X, test_Y, run):
+
+def evaluate_model(master_data_size, test_X, test_Y, run, split_ratio):
+    print(f"Test_X shape: {test_X.shape}, Test_Y shape: {test_Y.shape}")
+    model_path = f'实验三models/真KAN/GRU_best_model_master_data_size_{master_data_size}_ratio1to{split_ratio}_run_{run}.h5'
+    print(f"🔍 Trying to load model from: {model_path}")
+    
     try:
-        # 加载每次运行中验证集上表现最好的模型
-        model_path = f'实验三models/GRU_best_model_master_data_size_{master_data_size}_run_{run}.h5'
         model = load_model(model_path)
     except FileNotFoundError:
-        print(f"Model for master_data_size {master_data_size}, run {run} not found at {model_path}. Skipping this run.")
+        print(f"❌ Model not found at {model_path}. Skipping run {run}.")
         return None
     except ValueError as e:
-        print(f"Error loading model: {e}")
+        print(f"❌ Error loading model: {e}")
         return None
 
-    # 在测试集上评估模型性能
+    # 测试集评估
     test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
-    print(f'master_data_size {master_data_size}, Run {run} - Test Accuracy: {test_acc:.3f}')
+    print(f'✅ master_data_size {master_data_size}, Run {run} - Test Accuracy: {test_acc:.3f}')
 
-    # 预测概率和分类标签
-    yhat_probs = model.predict(test_X, verbose=0)
-    yhat_probs = yhat_probs[:, 0]
+    # 预测 & 分类
+    yhat_probs = model.predict(test_X, verbose=0)[:, 0]
     yhat_classes = (yhat_probs > 0.5).astype(int)
 
-    # 计算并打印性能指标
+    # 性能指标
     accuracy = accuracy_score(test_Y, yhat_classes)
     precision = precision_score(test_Y, yhat_classes)
     recall = recall_score(test_Y, yhat_classes)
     f1 = f1_score(test_Y, yhat_classes)
-    conf_matrix = confusion_matrix(test_Y, yhat_classes)
+    auc = roc_auc_score(test_Y, yhat_probs)
 
-    print(f'master_data_size {master_data_size}, Run {run} - Accuracy: {accuracy:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - Precision: {precision:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - Recall: {recall:.3f}')
-    print(f'master_data_size {master_data_size}, Run {run} - F1 Score: {f1:.3f}')
+    conf_matrix = confusion_matrix(test_Y, yhat_classes)
+    tn, fp, fn, tp = conf_matrix.ravel()
+    # 输出所有指标
+    print(f'📊 Eval Results - Acc: {accuracy:.3f} | Prec: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f} | AUC: {auc:.3f}')
+    print(f'🧮 Confusion Matrix:\n{conf_matrix}')
+    
     return {
         'master_data_size': master_data_size,
+        'split_ratio': split_ratio,
         'run': run,
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
-        'f1_score': f1
+        'f1_score': f1,
+        'auc': auc,
+        'tn': tn,
+        'fp': fp,
+        'fn': fn,
+        'tp': tp
     }
 
-# 保存结果到 CSV
+
+# ✅ 安全地保存结果到 CSV（避免空写入）
 def save_results_to_csv(results, filepath):
+    if not results:
+        print("⚠️ No results to save.")
+        return
     df = pd.DataFrame(results)
     df.to_csv(filepath, index=False)
-    print(f"Results saved to {filepath}")
+    print(f"✅ Results saved to {filepath}")
 
-# 主函数
+# ✅ 主程序
 if __name__ == "__main__":
     results = []
-    csv_file_path = 'E3_GRU_model_results.csv'  # 保存结果的CSV文件路径
-      # 每个 master_data_size 运行 20 次
-    master_data_sizes = [15, 18, 21, 24, 27]  # 预定义的 master_data_size 值
+    csv_file_path = 'E3_GRU_model_results.csv'
+    os.makedirs(os.path.dirname(csv_file_path) or ".", exist_ok=True)
+
+    master_data_sizes = [15, 18, 21, 24, 27]
+    split_ratios = [1, 2, 5, 10, 25]
 
     for master_data_size in master_data_sizes:
-        # Step 1: 加载保存好的训练数据
-        train_x_path = f'data/npy_test_master_data_size_{master_data_size}/trainX.npy'
-        train_y_path = f'data/npy_test_master_data_size_{master_data_size}/trainY.npy'
-        test_x_path = f'data/npy_test_master_data_size_{master_data_size}/testX.npy'
-        test_y_path = f'data/npy_test_master_data_size_{master_data_size}/testY.npy'
+        for split_ratio in split_ratios:
+            print(f"\n🔧 Processing master_data_size = {master_data_size}, split_ratio = 1:{split_ratio}")
 
-        try:
-            train_GRU_X = np.load(train_x_path)
-            train_GRU_y = np.load(train_y_path)
-            test_X = np.load(test_x_path)
-            test_Y = np.load(test_y_path)
-        except FileNotFoundError as e:
-            print(f"Training or test data for master_data_size {master_data_size} not found: {e}")
-            continue
+            train_x_path = f'data/npy_merged_master_data_size_{master_data_size}/trainX.npy'
+            train_y_path = f'data/npy_merged_master_data_size_{master_data_size}/trainY.npy'
+            test_x_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testX.npy'
+            test_y_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testY.npy'
 
-        print(f"train_GRU_X shape: {train_GRU_X.shape}, train_GRU_y shape: {train_GRU_y.shape}")
-
-        # Step 2: 划分训练集和验证集
-        train_GRU_X, val_GRU_X, train_GRU_y, val_GRU_y = train_test_split(
-            train_GRU_X, train_GRU_y, test_size=0.2, random_state=42, stratify=train_GRU_y)
-
-        # 训练并评估模型 20 次
-        for run in range(1,  21):  # 每个 master_data_size 运行 20 次
-            print(f"Training master_data_size {master_data_size}, run {run}...")
             try:
-                # Step 3: 构建和训练 GRU 模型
-                input_shape = (train_GRU_X.shape[1], train_GRU_X.shape[2])
-                model = masked_GRU_model(input_shape)
-                
-                # 定义 ModelCheckpoint 回调函数，保存每次 run 中验证集上性能最好的模型
-                model_save_path = f'实验三models/GRU_best_model_master_data_size_{master_data_size}_run_{run}.h5'
-                checkpoint = ModelCheckpoint(model_save_path, monitor='val_accuracy', verbose=1,
-                                             save_best_only=True, mode='max')
+                train_GRU_X = np.load(train_x_path)
+                train_GRU_y = np.load(train_y_path)
+                test_X = np.load(test_x_path)
+                test_Y = np.load(test_y_path)
+            except FileNotFoundError as e:
+                print(f"❌ Data not found: {e}")
+                continue
 
-                # 训练模型
-                model.fit(train_GRU_X, train_GRU_y, epochs=25, batch_size=64, validation_data=(val_GRU_X, val_GRU_y),
-                          callbacks=[checkpoint])
+            print(f"✅ Loaded train shape: {train_GRU_X.shape}, {train_GRU_y.shape}")
 
-                # Step 4: 在测试集上评估模型
-                result = evaluate_model(master_data_size, test_X, test_Y, run)
-                if result:
-                    results.append(result)
-                    # 每次评估后保存结果
+            # 训练/验证集划分
+            train_GRU_X, val_GRU_X, train_GRU_y, val_GRU_y = train_test_split(
+                train_GRU_X, train_GRU_y, test_size=0.2, random_state=42, stratify=train_GRU_y)
+
+            for run in range(1, 21):
+                print(f"🚀 Training Run {run} | master_data_size={master_data_size}, split_ratio=1:{split_ratio}")
+                try:
+                    input_shape = (train_GRU_X.shape[1], train_GRU_X.shape[2])
+                    model = masked_GRU_model(input_shape)
+
+                    model_save_path = f'实验三models/真KAN/GRU_best_model_master_data_size_{master_data_size}_ratio1to{split_ratio}_run_{run}.h5'
+                    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+
+                    checkpoint = ModelCheckpoint(model_save_path, monitor='val_accuracy', verbose=0,
+                                                 save_best_only=True, mode='max')
+
+                    start_time = time.time()
+                    model.fit(
+                        train_GRU_X, train_GRU_y,
+                        epochs=25,
+                        batch_size=64,
+                        validation_data=(val_GRU_X, val_GRU_y),
+                        callbacks=[checkpoint, TqdmCallback(verbose=1)]
+                    )
+                    print(f"⏱️ Time for run {run}: {time.time() - start_time:.2f}s")
+
+                    # ✅ 现在正确传入 split_ratio
+                    result = evaluate_model(master_data_size, test_X, test_Y, run, split_ratio)
+                    if result:
+                        print(f"📌 Result: {result}")
+                        results.append(result)
+                        save_results_to_csv(results, csv_file_path)
+
+                except Exception as e:
+                    print(f"❌ Error in run {run}: {e}")
                     save_results_to_csv(results, csv_file_path)
-            except Exception as e:
-                print(f"Error during training or evaluation at master_data_size {master_data_size}, run {run}: {e}")
-                save_results_to_csv(results, csv_file_path)
-                continue  # 继续下一个 run 或 master_data_size
+                    continue
 
-    # 最终输出所有结果并保存
-    print("\nFinal Results:")
+    print("\n✅ All Finished. Summary:")
     for result in results:
         print(result)
-    
-    # 保存最终结果
     save_results_to_csv(results, csv_file_path)
