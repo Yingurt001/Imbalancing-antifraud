@@ -1,210 +1,344 @@
+
+
+import tensorflow as tf
+ops = tf
 import os
-import pandas as pd
 import numpy as np
-import random
-import csv
-
-# generate_train_data.py
-import os
+import tensorflow as tf
+import keras
+from keras import backend
+from keras.src import initializers
+from keras.src.layers import Layer, Dropout, LayerNormalization
+from keras.models import Model,load_model
+from keras.layers import GRU, LSTM, Dense, Dropout, BatchNormalization, Input, Masking, Layer
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from concurrent.futures import ThreadPoolExecutor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,confusion_matrix,roc_auc_score
 import pandas as pd
-import numpy as np
-import random
-import csv
+from keras.utils import CustomObjectScope
+from tqdm.keras import TqdmCallback
+import time
+# 自定义 KANLayer
 
-# Step 1: 读取数据并排序
-def load_and_process_data(input_file, fraction=0.5, seed=42):
-    """
-    读取 CSV 文件并按 LOAN SEQUENCE NUMBER 分组，用于按贷款追踪每个样本的历史序列。
-    支持基于贷款编号的分组抽样（而非逐行抽样）。
-    
-    参数：
-    - input_file: 输入的 CSV 文件路径
-    - fraction: 要抽取的贷款比例（如 0.3 表示抽取 30% 的贷款编号）
-    - seed: 随机种子，确保可重复性
+@keras.utils.register_keras_serializable(package="keras_efficient_kan", name="GridInitializer")
+class GridInitializer(initializers.Initializer):
+    def __init__(self, grid_range, grid_size, spline_order):
+        self.grid_range = grid_range
+        self.grid_size = grid_size
+        self.spline_order = spline_order
 
-    返回：
-    - grouped_data: 抽样后的分组对象
-    - df: 抽样后的完整 DataFrame（未打乱）
-    """
-    df = pd.read_csv(input_file)
+    def __call__(self, shape, dtype=None):
+        h = (self.grid_range[1] - self.grid_range[0]) / self.grid_size
+        start = -self.spline_order * h + self.grid_range[0]
+        stop = (self.grid_size + self.spline_order) * h + self.grid_range[0]
+        num = self.grid_size + 2 * self.spline_order + 1
+        
+        # Create the grid using numpy
+        grid = np.linspace(start, stop, num, dtype=np.float32)
+        
+        # Repeat the grid for each feature
+        grid = np.tile(grid, (shape[1], 1))
+        
+        # Add the batch dimension
+        grid = np.expand_dims(grid, 0)
+        
+        # Convert to the appropriate backend tensor
+        return ops.convert_to_tensor(grid, dtype=dtype)
 
-    # 1. 获取所有唯一贷款编号
-    unique_loans = df['LOAN SEQUENCE NUMBER'].unique()
-
-    # 2. 如果需要进行抽样，则只保留部分贷款编号
-    if 0 < fraction < 1.0:
-        np.random.seed(seed)
-        sampled_loans = np.random.choice(unique_loans, size=int(len(unique_loans) * fraction), replace=False)
-        df = df[df['LOAN SEQUENCE NUMBER'].isin(sampled_loans)]
-
-    # 3. 按照贷款编号排序（为了可重复性）
-    sorted_data = df.sort_values('LOAN SEQUENCE NUMBER')
-    grouped_data = sorted_data.groupby('LOAN SEQUENCE NUMBER')
-
-    return grouped_data, df
-
-
-# Step 2: 构建训练集
-def build_train_data(grouped_data, master_data_size, stats_accumulator):
-    train_data_X = []
-    train_data_Y = []
-    predict_month = 3
-    SPLIT = 1
-
-    total_rows_all_groups = 0
-    all_group_sizes = []
-    num_defaults = 0
-
-    for _, group in grouped_data:
-        group = group.sort_values('REMAINING MONTHS TO LEGAL MATURITY', ascending=False)
-        group_size = len(group)
-        total_rows_all_groups += group_size
-        all_group_sizes.append(group_size)
-
-        if group.iloc[:, -1].sum() > 0:
-            num_defaults += 1
-
-        if group_size >= master_data_size + predict_month:
-            X = group.iloc[0:master_data_size, 1:-1]
-            Y = group.iloc[master_data_size:master_data_size + predict_month, -1]
-
-            # 删除潜在泄漏变量
-            cols_to_remove = ['ZERO BALANCE CODE', 'REMAINING MONTHS TO LEGAL MATURITY']
-            for col in cols_to_remove:
-                if col in X.columns:
-                    X = X.drop(columns=col)
-
-            label = 1 if Y.sum() > 0 else 0
-            train_data_X.append(X.values)
-            train_data_Y.append(label)
-
-    # 累计统计
-    stats_accumulator["original_sample_size"] += total_rows_all_groups
-    stats_accumulator["original_num_loans"] += len(all_group_sizes)
-    stats_accumulator["original_total_loan_length"] += sum(all_group_sizes)
-    stats_accumulator["original_num_defaults"] += num_defaults
-
-    # 欠采样
-    default = [(x, 1) for x, y in zip(train_data_X, train_data_Y) if y == 1]
-    undefault = [(x, 0) for x, y in zip(train_data_X, train_data_Y) if y == 0]
-    combined = default + undefault[:SPLIT * len(default)]
-    random.shuffle(combined)
-
-    train_X = [x for x, _ in combined]
-    train_Y = [y for _, y in combined]
-
-    stats_accumulator["final_sample_size"] += sum([len(x) for x in train_X])
-    stats_accumulator["final_num_loans"] += len(train_X)
-    stats_accumulator["final_total_loan_length"] += sum([len(x) for x in train_X])
-    stats_accumulator["final_num_defaults"] += sum(train_Y)
-
-    return np.array(train_X, dtype='float32'), np.array(train_Y, dtype='float32')
-
-
-# Step 3: 保存数据
-def save_data(X, Y, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    np.save(os.path.join(output_dir, 'trainX.npy'), X)
-    np.save(os.path.join(output_dir, 'trainY.npy'), Y)
-    print(f"✅ Saved to {output_dir} | Samples: {len(Y)}, Defaults: {int(Y.sum())}, Non-defaults: {len(Y) - int(Y.sum())}")
-
-
-
-if __name__ == "__main__":
-    input_files = [
-        "data/processed_data/historical_data_time_2018Q1.csv",
-        "data/processed_data/historical_data_time_2018Q2.csv",
-        "data/processed_data/historical_data_time_2018Q3.csv",
-        "data/processed_data/historical_data_time_2018Q4.csv"
-    ]
-
-    master_data_sizes = [12,15,18,21,24,27]
-
-    # 统计文件路径
-    stats_csv_path = "statistics_summary.csv"
-    write_header = not os.path.exists(stats_csv_path)
-
-    # 提取年份（从第一个文件名中提取 '2018Q1' -> '2018'）
-    first_file = os.path.basename(input_files[0])
-    year_str = next((part[:4] for part in first_file.split('_') if part[:4].isdigit()), "Unknown")
-
-    for master_data_size in master_data_sizes:
-        print(f"\n🔧 Processing master_data_size = {master_data_size} ...")
-
-        all_train_X = []
-        all_train_Y = []
-
-        stats = {
-            "original_sample_size": 0,
-            "original_num_loans": 0,
-            "original_total_loan_length": 0,
-            "original_num_defaults": 0,
-            "final_sample_size": 0,
-            "final_num_loans": 0,
-            "final_total_loan_length": 0,
-            "final_num_defaults": 0
+    def get_config(self):
+        return {
+            "grid_range": self.grid_range,
+            "grid_size": self.grid_size,
+            "spline_order": self.spline_order
         }
 
-        for input_file in input_files:
-            if not os.path.exists(input_file):
-                print(f"❌ File not found: {input_file}")
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+@keras.utils.register_keras_serializable(package="keras_efficient_kan", name="KANLinear")
+class KANLinear(Layer):
+    def __init__(
+        self,
+        units,
+        grid_size=3,
+        spline_order=3,
+        base_activation='relu',
+        grid_range=[-1, 1],
+        dropout=0.,
+        use_bias=True,
+        use_layernorm=True,
+        **kwargs
+    ):
+        super(KANLinear, self).__init__(**kwargs)
+        self.units = units
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+        self.base_activation_name = base_activation
+        self.grid_range = grid_range
+        self.use_bias = use_bias
+        self.use_layernorm = use_layernorm
+        self.dropout_rate = dropout
+        self.dropout = Dropout(self.dropout_rate)
+        if self.use_layernorm:
+            self.layer_norm = LayerNormalization(axis=-1)
+        else:
+            self.layer_norm = None
+        self.in_features = None
+
+    def build(self, input_shape):
+        self.in_features = input_shape[-1]
+        dtype = backend.floatx()
+        
+        self.grid = self.add_weight(
+            name="grid",
+            shape=[1, self.in_features, self.grid_size + 2 * self.spline_order + 1],
+            initializer=GridInitializer(self.grid_range, self.grid_size, self.spline_order),
+            trainable=False,
+            dtype=dtype
+        )
+
+        self.base_weight = self.add_weight(
+            name="base_weight",
+            shape=[self.in_features, self.units],
+            initializer='glorot_uniform',
+            dtype=dtype
+        )
+        if self.use_bias:
+            self.base_bias = self.add_weight(
+                name="base_bias",
+                shape=[self.units],
+                initializer="zeros",
+                dtype=dtype
+            )
+        self.spline_weight = self.add_weight(
+            name="spline_weight",
+            shape=[self.in_features * (self.grid_size + self.spline_order), self.units],
+            initializer='glorot_uniform',
+            dtype=dtype
+        )
+        if self.use_layernorm:
+            self.layer_norm.build(input_shape)
+        
+        self.built = True
+
+    def call(self, x, training=None):
+        input_shape = ops.shape(x)
+        x = ops.cast(x, self.dtype)
+        x_2d = ops.reshape(x, [-1, self.in_features])
+        
+        if self.use_layernorm:
+            x_2d = self.layer_norm(x_2d)
+        
+        base_activation = getattr(tf.nn, self.base_activation_name)
+        base_output = ops.matmul(base_activation(x_2d), self.base_weight)
+        if self.use_bias:
+            base_output = ops.add(base_output, self.base_bias)
+        
+        spline_output = ops.matmul(self.b_splines(x_2d), self.spline_weight)
+        output_2d = self.dropout(base_output, training=training) + self.dropout(spline_output, training=training)
+        
+        # Use ops.reshape with a tuple of integers for the new shape
+        new_shape = tf.concat([input_shape[:-1], [self.units]], axis=0)
+        return ops.reshape(output_2d, new_shape)
+
+    def b_splines(self, x):
+        x_expanded = ops.expand_dims(x, -1)
+        bases = ops.cast((x_expanded >= self.grid[..., :-1]) & (x_expanded < self.grid[..., 1:]), self.dtype)
+        
+        for k in range(1, self.spline_order + 1):
+            left_denominator = self.grid[..., k:-1] - self.grid[..., :-(k + 1)]
+            right_denominator = self.grid[..., k + 1:] - self.grid[..., 1:-k]
+            
+            left = (x_expanded - self.grid[..., :-(k + 1)]) / left_denominator
+            right = (self.grid[..., k + 1:] - x_expanded) / right_denominator
+            bases = left * bases[..., :-1] + right * bases[..., 1:]
+        return ops.reshape(bases, [ops.shape(x)[0], -1])
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[:-1] + (self.units,)
+
+    def get_config(self):
+        config = super(KANLinear, self).get_config()
+        config.update({
+            'units': self.units,
+            'grid_size': self.grid_size,
+            'spline_order': self.spline_order,
+            'base_activation': self.base_activation_name,
+            'grid_range': self.grid_range,
+            'dropout': self.dropout_rate,
+            'use_bias': self.use_bias,
+            'use_layernorm': self.use_layernorm,
+        })
+        return config
+
+    def get_build_config(self):
+        return {"in_features": self.in_features}
+
+    def build_from_config(self, config):
+        self.build((None, config["in_features"]))
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+# 构建模型
+def KANS_GRU_model(input_shape, output_dim=1, num_functions=10):
+    inputs = Input(shape=input_shape)
+    masked_input = Masking(mask_value=0.0)(inputs)
+    
+    # GRU layers
+    gru_out = GRU(128, return_sequences=True)(masked_input)
+    gru_out = BatchNormalization()(gru_out)
+    gru_out2 = GRU(64, return_sequences=False)(gru_out)
+    
+    # KAN layer
+    kan_out = KANLinear(units=5, grid_size=3, spline_order=3)(gru_out2)
+    
+    # Dense layer + Dropout
+    dense_out = Dense(64, activation='relu')(kan_out)
+    dropout_out = Dropout(0.3)(dense_out)
+    
+    # Output layer
+    outputs = Dense(1, activation='sigmoid')(dropout_out)
+    
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+    
+    return model
+
+# 评估模型性能的函数
+def evaluate_model(master_data_size, test_X, test_Y, run, split_ratio):
+    print(f"Test_X shape: {test_X.shape}, Test_Y shape: {test_Y.shape}")
+    model_path = f'实验三models/真KAN/KAN_GRU_best_model_master_data_size_{master_data_size}_ratio1to{split_ratio}_run_{run}.h5'
+    print(f"🔍 Trying to load model from: {model_path}")
+    
+    try:
+        model = load_model(model_path, custom_objects={'KANLinear': KANLinear})
+    except FileNotFoundError:
+        print(f"❌ Model not found at {model_path}. Skipping run {run}.")
+        return None
+    except ValueError as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+
+    # 测试集评估
+    test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
+    print(f'✅ master_data_size {master_data_size}, Run {run} - Test Accuracy: {test_acc:.3f}')
+
+    # 预测 & 分类
+    yhat_probs = model.predict(test_X, verbose=0)[:, 0]
+    yhat_classes = (yhat_probs > 0.5).astype(int)
+
+    # 性能指标
+    accuracy = accuracy_score(test_Y, yhat_classes)
+    precision = precision_score(test_Y, yhat_classes)
+    recall = recall_score(test_Y, yhat_classes)
+    f1 = f1_score(test_Y, yhat_classes)
+    auc = roc_auc_score(test_Y, yhat_probs)
+
+    conf_matrix = confusion_matrix(test_Y, yhat_classes)
+    tn, fp, fn, tp = conf_matrix.ravel()
+    # 输出所有指标
+    print(f'📊 Eval Results - Acc: {accuracy:.3f} | Prec: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f} | AUC: {auc:.3f}')
+    print(f'🧮 Confusion Matrix:\n{conf_matrix}')
+    
+    return {
+        'master_data_size': master_data_size,
+        'split_ratio': split_ratio,
+        'run': run,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'auc': auc,
+        'tn': tn,
+        'fp': fp,
+        'fn': fn,
+        'tp': tp
+    }
+
+
+# ✅ 安全地保存结果到 CSV（避免空写入）
+def save_results_to_csv(results, filepath):
+    if not results:
+        print("⚠️ No results to save.")
+        return
+    df = pd.DataFrame(results)
+    df.to_csv(filepath, index=False)
+    print(f"✅ Results saved to {filepath}")
+
+# ✅ 主程序
+if __name__ == "__main__":
+    results = []
+    csv_file_path = 'E3_KAN_GRU_model_results.csv'
+    os.makedirs(os.path.dirname(csv_file_path) or ".", exist_ok=True)
+
+    master_data_sizes = [12, 18]
+    split_ratios = [1, 2, 5, 10, 25]
+
+    for master_data_size in master_data_sizes:
+        for split_ratio in split_ratios:
+            print(f"\n🔧 Processing master_data_size = {master_data_size}, split_ratio = 1:{split_ratio}")
+
+            train_x_path = f'data/npy_merged_master_data_size_{master_data_size}/trainX.npy'
+            train_y_path = f'data/npy_merged_master_data_size_{master_data_size}/trainY.npy'
+            test_x_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testX.npy'
+            test_y_path  = f'data/test_merged_2019_master{master_data_size}_ratio1to{split_ratio}/testY.npy'
+
+            try:
+                train_GRU_X = np.load(train_x_path)
+                train_GRU_y = np.load(train_y_path)
+                test_X = np.load(test_x_path)
+                test_Y = np.load(test_y_path)
+            except FileNotFoundError as e:
+                print(f"❌ Data not found: {e}")
                 continue
 
-            grouped_data, full_df = load_and_process_data(input_file)
-            train_X, train_Y = build_train_data(grouped_data, master_data_size, stats)
+            print(f"✅ Loaded train shape: {train_GRU_X.shape}, {train_GRU_y.shape}")
 
-            all_train_X.append(train_X)
-            all_train_Y.append(train_Y)
+            # 训练/验证集划分
+            train_GRU_X, val_GRU_X, train_GRU_y, val_GRU_y = train_test_split(
+                train_GRU_X, train_GRU_y, test_size=0.2, random_state=42, stratify=train_GRU_y)
 
-            print(f"  ✅ File {os.path.basename(input_file)} -> Samples: {len(train_Y)}")
+            for run in range(1, 3):
+                print(f"🚀 Training Run {run} | master_data_size={master_data_size}, split_ratio=1:{split_ratio}")
+                try:
+                    input_shape = (train_GRU_X.shape[1], train_GRU_X.shape[2])
+                    model = KANS_GRU_model(input_shape)
 
-        if all_train_X and all_train_Y:
-            final_train_X = np.concatenate(all_train_X, axis=0)
-            final_train_Y = np.concatenate(all_train_Y, axis=0)
+                    model_save_path = f'实验三models/真KAN/KAN_GRU_best_model_master_data_size_{master_data_size}_ratio1to{split_ratio}_run_{run}.h5'
+                    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
 
-            output_dir = f'data/npy_merged_master_data_size_{master_data_size}'
-            save_data(final_train_X, final_train_Y, output_dir=output_dir)
+                    checkpoint = ModelCheckpoint(model_save_path, monitor='val_accuracy', verbose=0,
+                                                 save_best_only=True, mode='max')
 
-            avg_len = stats['original_total_loan_length'] / stats['original_num_loans'] if stats['original_num_loans'] else 0
-            final_avg_len = stats['final_total_loan_length'] / stats['final_num_loans'] if stats['final_num_loans'] else 0
-            default_rate = stats['original_num_defaults'] / stats['original_num_loans'] if stats['original_num_loans'] else 0
-            final_default_rate = stats['final_num_defaults'] / stats['final_num_loans'] if stats['final_num_loans'] else 0
+                    start_time = time.time()
+                    model.fit(
+                        train_GRU_X, train_GRU_y,
+                        epochs=25,
+                        batch_size=64,
+                        validation_data=(val_GRU_X, val_GRU_y),
+                        callbacks=[checkpoint, TqdmCallback(verbose=1)]
+                    )
+                    print(f"⏱️ Time for run {run}: {time.time() - start_time:.2f}s")
 
-            # ✅ 追加写入 CSV 文件
-            with open(stats_csv_path, mode="a", newline="") as file:
-                writer = csv.writer(file)
-                if write_header:
-                    writer.writerow([
-                        "year",  # 新增年份列
-                        "master_data_size",
-                        "original_sample_size",
-                        "original_num_loans",
-                        "avg_loan_length",
-                        "num_defaults",
-                        "default_rate",
-                        "final_sample_size",
-                        "final_num_loans",
-                        "final_avg_loan_length",
-                        "final_num_defaults",
-                        "final_default_rate"
-                    ])
-                    write_header = False
+                    # ✅ 现在正确传入 split_ratio
+                    result = evaluate_model(master_data_size, test_X, test_Y, run, split_ratio)
+                    if result:
+                        print(f"📌 Result: {result}")
+                        results.append(result)
+                        save_results_to_csv(results, csv_file_path)
 
-                writer.writerow([
-                    year_str,
-                    master_data_size,
-                    stats['original_sample_size'],
-                    stats['original_num_loans'],
-                    round(avg_len, 2),
-                    stats['original_num_defaults'],
-                    round(default_rate, 4),
-                    stats['final_sample_size'],
-                    stats['final_num_loans'],
-                    round(final_avg_len, 2),
-                    stats['final_num_defaults'],
-                    round(final_default_rate, 4)
-                ])
+                except Exception as e:
+                    print(f"❌ Error in run {run}: {e}")
+                    save_results_to_csv(results, csv_file_path)
+                    continue
 
-            print(f"📈 Stats saved to {stats_csv_path}")
-        else:
-            print(f"⚠️ Skipped saving for master_data_size = {master_data_size}, no data.")
+    print("\n✅ All Finished. Summary:")
+    for result in results:
+        print(result)
+    save_results_to_csv(results, csv_file_path)
