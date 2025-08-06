@@ -83,9 +83,20 @@ def build_test_data(grouped_data, master_data_size, split_ratio, stats_accumulat
     # 执行欠采样
     default = [(x, 1) for x, y in zip(test_data_X, test_data_Y) if y == 1]
     undefault = [(x, 0) for x, y in zip(test_data_X, test_data_Y) if y == 0]
-    sampled_undefault = undefault[:split_ratio * len(default)]  # 根据比例选取负样本
-    combined = default + sampled_undefault
+
+    if len(default) == 0:
+        return np.array([]), np.array([])
+
+    if len(undefault) < split_ratio * len(default):
+        # 非违约样本不足，直接保留全部样本
+        combined = default + undefault
+        print(f"⚠️ Not enough non-default samples to match 1:{split_ratio}, using full dataset instead.")
+    else:
+        sampled_undefault = undefault[:split_ratio * len(default)]
+        combined = default + sampled_undefault
+
     random.shuffle(combined)  # 打乱顺序
+
 
     # 记录最终样本集统计信息
     stats_accumulator["final_sample_size"] += sum([len(x[0]) for x in combined])
@@ -124,7 +135,7 @@ if __name__ == "__main__":
     ]
 
     # 设置不同的主数据长度和采样比例
-    master_data_sizes = [12, 15, 18, 21, 24, 27]
+    master_data_sizes = [12,18]
     split_ratios = [1, 2, 5, 10, 25]
 
     # 汇总统计信息保存路径
