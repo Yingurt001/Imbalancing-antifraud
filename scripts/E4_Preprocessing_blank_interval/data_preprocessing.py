@@ -64,10 +64,10 @@ def batch_preprocess_custom_files(file_list, output_dir):
 if __name__ == "__main__":
     # 指定要处理的多个文件路径：
     file_list = [
-        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2020Q1.txt",
-        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2020Q2.txt",
-        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2020Q3.txt",
-        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2020Q4.txt"
+        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2018Q1.txt",
+        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2018Q2.txt",
+        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2018Q3.txt",
+        "/Users/zhangying/Documents/Imbalance data&Financial Fraud/Dataset/historical_data/historical_data_time_2018Q4.txt"
     ]
 
     output_dir = "/Users/zhangying/Documents/Imbalance data&Financial Fraud/data/processed_data"
